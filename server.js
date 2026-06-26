@@ -1,22 +1,3 @@
-// server.js — Servidor que RENDERIZA um documento HTML em PDF usando o Chrome instalado no próprio
-// container (Debian + chromium via apt, com TODAS as bibliotecas de sistema — sem o problema do
-// libnss3 que o serverless da Vercel tinha) e envia por e-mail via SMTP (Nodemailer).
-//
-// É o MESMO motor da função da Vercel, só que num formato de servidor que fica sempre ligado e roda
-// num container onde o Chrome tem tudo o que precisa. Endpoint igual: POST /api/send-pdf.
-//
-// RECEBE POST JSON: { to, subject, html, filename, documentHtml }
-//   - documentHtml: HTML COMPLETO do documento (o mesmo da impressão) a renderizar em PDF.
-//   - to: e-mail (string) ou lista. Se ausente, só renderiza e devolve o PDF (não envia).
-//   - subject/html: assunto e corpo do e-mail. filename: nome do anexo.
-//   (compat: aceita pdfBase64 direto, caminho antigo.)
-// DEVOLVE: { ok:true, id, pdfBase64 }.
-//
-// VARIÁVEIS DE AMBIENTE (no painel do Railway → Variables) — a senha de app fica SÓ aqui:
-//   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS (senha de app), MAIL_FROM (opc),
-//   ALLOW_ORIGIN (CORS), SHARED_SECRET (header X-App-Secret).
-//   PORT é injetada pela plataforma automaticamente.
-
 import express from 'express';
 import nodemailer from 'nodemailer';
 import puppeteer from 'puppeteer-core';
@@ -32,23 +13,28 @@ function criarTransporter() {
     return nodemailer.createTransport({
         host: process.env.SMTP_HOST,
         port: SMTP_PORT,
-        secure: SMTP_PORT === 465, // 465 = SSL; 587 = STARTTLS
+        secure: SMTP_PORT === 465,
         auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
     });
 }
 
-// Renderiza HTML -> PDF (Buffer) com o Chrome do container. A4, fundo impresso, mídia "print"
-// (idêntico ao "Salvar PDF" do navegador). --no-sandbox / --disable-dev-shm-usage são necessários
-// para rodar Chrome dentro de container.
 async function renderizarHtmlParaPdf(documentHtml) {
     const browser = await puppeteer.launch({
         executablePath: CHROME_PATH,
         headless: 'new',
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+        protocolTimeout: 120000,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--single-process',
+            '--no-zygote'
+        ]
     });
     try {
         const page = await browser.newPage();
-        await page.setContent(String(documentHtml), { waitUntil: 'networkidle0' });
+        await page.setContent(String(documentHtml), { waitUntil: 'domcontentloaded', timeout: 60000 });
         await page.emulateMediaType('print');
         const pdf = await page.pdf({
             format: 'A4',
@@ -64,7 +50,6 @@ async function renderizarHtmlParaPdf(documentHtml) {
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
-// CORS
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', ALLOW_ORIGIN);
     res.setHeader('Vary', 'Origin');
@@ -74,11 +59,9 @@ app.use((req, res, next) => {
     next();
 });
 
-// Healthcheck (a plataforma usa pra saber que o serviço está vivo).
 app.get('/', (req, res) => res.status(200).json({ ok: true, service: 'render-pdf' }));
 
 app.post('/api/send-pdf', async (req, res) => {
-    // porteiro simples
     if (SHARED_SECRET && req.headers['x-app-secret'] !== SHARED_SECRET) {
         return res.status(401).json({ error: 'unauthorized' });
     }
